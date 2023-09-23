@@ -72,6 +72,7 @@ typedef struct {
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
+    int arc; // llama2 architecture 1, stories 0
 } Transformer;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -171,6 +172,8 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
+    // architecture
+    t->arc = strstr(checkpoint_path, "Stories") == NULL ? 1 : 0;
 }
 
 void free_transformer(Transformer* t) {
@@ -245,6 +248,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
+    int arc = transformer->arc;
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
@@ -262,19 +266,48 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        for (int i = 0; i < dim; i+=2) {
-            int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-            float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++) {
-                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                float v0 = vec[i];
-                float v1 = vec[i+1];
-                vec[i]   = v0 * fcr - v1 * fci;
-                vec[i+1] = v0 * fci + v1 * fcr;
+        if (arc == 1)
+        {
+            for (int i = 0; i < p->n_heads; i++)
+            {
+                for (int j = 0; j < head_size / 2; j++){
+                    float freq = 1.0f / powf(10000.0f, 2.0f * (float)j / (float)head_size);
+                    float val = pos * freq;
+                    float fcr = cosf(val);
+                    float fci = sinf(val);
+                    float q0  = s->q[i * head_size + j];
+                    float q1  = s->q[i * head_size + j + head_size / 2];
+                    s->q[i * head_size + j]   = q0 * fcr - q1 * fci;
+                    s->q[i * head_size + j + head_size / 2] = q0 * fci + q1 * fcr;
+                    if (i < p->n_kv_heads){
+                        float k0  = s->k[i * head_size + j];
+                        float k1  = s->k[i * head_size + j + head_size / 2];
+                        s->k[i * head_size + j] = k0 * fcr - k1 * fci;
+                        s->k[i * head_size + j + head_size / 2] = k0 * fci + k1 * fcr;
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < p->n_heads; i++)
+            {
+                for (int j = 0; j < head_size; j+=2){
+                    float freq = 1.0f / powf(10000.0f, (float)j / (float)head_size);
+                    float val = pos * freq;
+                    float fcr = cosf(val);
+                    float fci = sinf(val);
+                    float q0  = s->q[i * head_size + 2 * j];
+                    float q1  = s->q[i * head_size + 2 * j + 1];
+                    s->q[i * head_size + 2 * j]   = q0 * fcr - q1 * fci;
+                    s->q[i * head_size + 2 * j + 1] = q0 * fci + q1 * fcr;
+                    if (i < p->n_kv_heads){
+                        float k0  = s->k[i * head_size + 2 * j];
+                        float k1  = s->k[i * head_size + 2 * j + 1];
+                        s->k[i * head_size + 2 * j] = k0 * fcr - k1 * fci;
+                        s->k[i * head_size + 2 * j + 1] = k0 * fci + k1 * fcr;
+                    }
+                }
             }
         }
 
@@ -365,7 +398,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // classifier into logits
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
-    return s->logits;
+        return s->logits;
 }
 
 // ----------------------------------------------------------------------------
@@ -446,12 +479,18 @@ void safe_printf(char *piece) {
             return; // bad byte, don't print it
         }
     }
-    printf("%s", piece);
+        printf("%s", piece);
 }
 
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
-    TokenIndex tok = { .str = str }; // acts as the key to search for
+    // deal with special tokens
+    char *input = "<0x0A>";
+    if (strcmp(str, "\\n") != 0)
+    {
+        input = str;
+    }
+    TokenIndex tok = { .str = input };
     TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
     return res != NULL ? res->id : -1;
 }
