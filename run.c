@@ -72,7 +72,7 @@ typedef struct {
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
-    int arc; // llama2 architecture 1, stories 0
+    int arc; // llama2 ROPE architecture 1, stories 0
 } Transformer;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -171,7 +171,7 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
     // architecture
-    t->arc = strstr(checkpoint_path, "Stories") == NULL ? 1 : 0;
+    t->arc = strstr(checkpoint_path, "stories") == NULL ? 1 : 0;
 }
 
 void free_transformer(Transformer* t) {
@@ -294,20 +294,20 @@ float* forward(Transformer* transformer, int token, int pos) {
         {
             for (int i = 0; i < p->n_heads; i++)
             {
-                for (int j = 0; j < head_size; j+=2){
+                for (int j = 0; j < head_size; j += 2){
                     float freq = 1.0f / powf(10000.0f, (float)j / (float)head_size);
                     float val = pos * freq;
                     float fcr = cosf(val);
                     float fci = sinf(val);
-                    float q0  = s->q[i * head_size + 2 * j];
-                    float q1  = s->q[i * head_size + 2 * j + 1];
-                    s->q[i * head_size + 2 * j]   = q0 * fcr - q1 * fci;
-                    s->q[i * head_size + 2 * j + 1] = q0 * fci + q1 * fcr;
+                    float q0  = s->q[i * head_size + j];
+                    float q1  = s->q[i * head_size + j + 1];
+                    s->q[i * head_size + j]   = q0 * fcr - q1 * fci;
+                    s->q[i * head_size + j + 1] = q0 * fci + q1 * fcr;
                     if (i < p->n_kv_heads){
-                        float k0  = s->k[i * head_size + 2 * j];
-                        float k1  = s->k[i * head_size + 2 * j + 1];
-                        s->k[i * head_size + 2 * j] = k0 * fcr - k1 * fci;
-                        s->k[i * head_size + 2 * j + 1] = k0 * fci + k1 * fcr;
+                        float k0  = s->k[i * head_size + j];
+                        float k1  = s->k[i * head_size + j + 1];
+                        s->k[i * head_size + j] = k0 * fcr - k1 * fci;
+                        s->k[i * head_size + j + 1] = k0 * fci + k1 * fcr;
                     }
                 }
             }
